@@ -9,6 +9,11 @@ use crate::backend::{FrameCopy};
 const LIGHTNESS_MIN: f32 = 15.0;
 
 /**
+ * Minimum lightness for a pixel.
+ */
+const LIGHTNESS_MAX: f32 = 85.0;
+
+/**
  * Minimum saturation for a pixel.
  */
 const SATURATION_MIN: f32 = 10.0;
@@ -16,24 +21,21 @@ const SATURATION_MIN: f32 = 10.0;
 /**
  * How many pixels to skip in a chunk, for performance.
  */
-const SKIP_PIXEL: usize = 16;
+const SKIP_PIXEL: usize = 8;
 
 
-pub fn determine_prominent_color(frame_copy: FrameCopy) -> Hsl {
+pub fn determine_prominent_color(frame_copy: FrameCopy, heatmap: &mut Vec<Vec<Vec<u32>>>) -> Hsl {
     if ColorType::Rgba8 != frame_copy.frame_color_type {
         panic!("Cannot handle frame!")
     };
-    // Find the modal colour from the frame.
-    // Split r,g,b into a 3 dimensional array.
-    let mut heatmap = vec![vec![vec![0u32; 21]; 21]; 37];
-
     let mut most_prominent= Hsl::from(0.0, 0.0, 0.0);
     let mut most_prominent_idx = 0;
     for chunk in frame_copy.data.chunks_exact(4 + (SKIP_PIXEL*4)) {
+
         let hsl = Rgb::from(chunk[0] as f32, chunk[1] as f32, chunk[2] as f32).to_hsl();
 
         // Reject any really dark colours.
-        if hsl.get_lightness() < LIGHTNESS_MIN {
+        if LIGHTNESS_MAX < hsl.get_lightness() || hsl.get_lightness() < LIGHTNESS_MIN {
             continue;
         }
         if hsl.get_saturation() < SATURATION_MIN {
@@ -64,10 +66,9 @@ mod test {
     use colors_transform::Color;
     use image::ColorType;
     use test::Bencher;
-    use wayland_client::protocol::wl_shm::Format;
     use std::fs::File;
 
-    use crate::{prominent_color::determine_prominent_color, backend::{FrameCopy, FrameFormat}};
+    use crate::{prominent_color::determine_prominent_color, backend::{FrameCopy}};
     
     #[test]
     fn test_determine_prominent_color() {
@@ -76,18 +77,12 @@ mod test {
         let mut buf = vec![0; reader.output_buffer_size()];
         let info = reader.next_frame(&mut buf).unwrap();
         let bytes = &buf[..info.buffer_size()];
+        let mut heatmap = vec![vec![vec![0u32; 21]; 21]; 37];
     
         let v = determine_prominent_color( FrameCopy {
             frame_color_type: ColorType::Rgba8,
-            frame_format: FrameFormat {
-                width: info.width,
-                height: info.height,
-                format: Format::Argb8888,
-                // Unused
-                stride: 0,
-            },
             data: bytes.to_vec(),
-        });
+        }, &mut heatmap);
     
         assert_eq!(v.get_hue(), 240.0, "Hue value is incorrect");
         assert_eq!(v.get_saturation(), 85.0, "Saturation value is incorrect");
@@ -95,24 +90,32 @@ mod test {
     }
 
     #[bench]
-    fn bench_determine_prominent_color(b: &mut Bencher) {
+    fn bench_determine_prominent_color_gradient(b: &mut Bencher) {
         let decoder = png::Decoder::new(File::open("samples/gradientrb.png").unwrap());
         let mut reader = decoder.read_info().unwrap();// Allocate the output buffer.
         let mut buf = vec![0; reader.output_buffer_size()];
         let info = reader.next_frame(&mut buf).unwrap();
         let bytes = &buf[..info.buffer_size()];
-
+        let mut heatmap = vec![vec![vec![0u32; 21]; 21]; 37];
 
         b.iter(|| determine_prominent_color( FrameCopy {
             frame_color_type: ColorType::Rgba8,
-            frame_format: FrameFormat {
-                width: info.width,
-                height: info.height,
-                format: Format::Argb8888,
-                // Unused
-                stride: 0,
-            },
             data: bytes.to_vec(),
-        }));
+        },&mut heatmap));
+    }
+
+    #[bench]
+    fn bench_determine_prominent_color_testcard(b: &mut Bencher) {
+        let decoder = png::Decoder::new(File::open("samples/testcard.png").unwrap());
+        let mut reader = decoder.read_info().unwrap();// Allocate the output buffer.
+        let mut buf = vec![0; reader.output_buffer_size()];
+        let info = reader.next_frame(&mut buf).unwrap();
+        let bytes = &buf[..info.buffer_size()];
+        let mut heatmap = vec![vec![vec![0u32; 21]; 21]; 37];
+
+        b.iter(|| determine_prominent_color( FrameCopy {
+            frame_color_type: ColorType::Rgba8,
+            data: bytes.to_vec(),
+        },&mut heatmap));
     }
 }
