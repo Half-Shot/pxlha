@@ -6,7 +6,7 @@ use std::{
     os::unix::prelude::RawFd,
     process::exit,
     sync::atomic::{AtomicBool, Ordering},
-    time::{SystemTime, UNIX_EPOCH}, io::{Read, Seek, SeekFrom},
+    time::{SystemTime, UNIX_EPOCH}, io::{Read, Seek},
 };
 
 use nix::{
@@ -128,7 +128,6 @@ enum FrameState {
 /// file that holds the image data in it.
 #[derive(Debug)]
 pub struct FrameCopy {
-    pub frame_format: FrameFormat,
     pub frame_color_type: ColorType,
     pub data: Vec<u8>,
 }
@@ -270,7 +269,6 @@ pub fn capture_output_frame(
                         }
                     };
                     return Ok(FrameCopy {
-                        frame_format: capturer.frame_format,
                         frame_color_type,
                         data,
                     });
