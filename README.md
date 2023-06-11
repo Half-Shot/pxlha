@@ -2,7 +2,7 @@
 
 Match your [Home Assistant](https://www.home-assistant.io/) controlled RGB lights to the output of your screen.
 
-## Reqirements
+## Requirements
 
 Currently the project has a very strict set of requirements:
 
