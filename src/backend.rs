@@ -1,14 +1,12 @@
 use std::{
-    cell::RefCell,
     error::Error,
     ffi::CStr,
     fs::File,
     os::unix::prelude::FromRawFd,
     os::unix::prelude::RawFd,
     process::exit,
-    rc::Rc,
     sync::atomic::{AtomicBool, Ordering},
-    time::{SystemTime, UNIX_EPOCH}, borrow::BorrowMut,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use nix::{
@@ -24,13 +22,88 @@ use image::{
 use memmap2::MmapMut;
 
 use wayland_client::{
-    protocol::{wl_output::WlOutput, wl_shm, wl_shm::Format},
-    Display, GlobalManager, Main
+    delegate_noop,
+    globals::GlobalList,
+    protocol::{
+        wl_buffer::WlBuffer, wl_output::WlOutput, wl_shm, wl_shm::Format, wl_shm::WlShm,
+        wl_shm_pool::WlShmPool,
+    },
+    Connection, Dispatch, QueueHandle,
+    WEnum::Value,
 };
-use wayland_protocols::wlr::unstable::screencopy::v1::client::{
+
+use wayland_protocols_wlr::screencopy::v1::client::{
     zwlr_screencopy_frame_v1, zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV1,
     zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1,
 };
+
+struct CaptureFrameState {
+    formats: Vec<FrameFormat>,
+    state: Option<FrameState>,
+    buffer_done: AtomicBool,
+}
+
+impl Dispatch<ZwlrScreencopyFrameV1, ()> for CaptureFrameState {
+    fn event(
+        frame: &mut Self,
+        _: &ZwlrScreencopyFrameV1,
+        event: zwlr_screencopy_frame_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            zwlr_screencopy_frame_v1::Event::Buffer {
+                format,
+                width,
+                height,
+                stride,
+            } => {
+                log::debug!("Received Buffer event");
+                if let Value(f) = format {
+                    frame.formats.push(FrameFormat {
+                        format: f,
+                        width,
+                        height,
+                        stride,
+                    })
+                } else {
+                    log::debug!("Received Buffer event with unidentified format");
+                    exit(1);
+                }
+            }
+            zwlr_screencopy_frame_v1::Event::Flags { .. } => {
+                log::debug!("Received Flags event");
+            }
+            zwlr_screencopy_frame_v1::Event::Ready { .. } => {
+                // If the frame is successfully copied, a “flags” and a “ready” events are sent. Otherwise, a “failed” event is sent.
+                // This is useful when we call .copy on the frame object.
+                log::debug!("Received Ready event");
+                frame.state.replace(FrameState::Finished);
+            }
+            zwlr_screencopy_frame_v1::Event::Failed => {
+                log::debug!("Received Failed event");
+                frame.state.replace(FrameState::Failed);
+            }
+            zwlr_screencopy_frame_v1::Event::Damage { .. } => {
+                log::debug!("Received Damage event");
+            }
+            zwlr_screencopy_frame_v1::Event::LinuxDmabuf { .. } => {
+                log::debug!("Received LinuxDmaBuf event");
+            }
+            zwlr_screencopy_frame_v1::Event::BufferDone => {
+                log::debug!("Received bufferdone event");
+                frame.buffer_done.store(true, Ordering::SeqCst);
+            }
+            _ => unreachable!(),
+        };
+    }
+}
+
+delegate_noop!(CaptureFrameState: ignore WlShm);
+delegate_noop!(CaptureFrameState: ignore WlShmPool);
+delegate_noop!(CaptureFrameState: ignore WlBuffer);
+delegate_noop!(CaptureFrameState: ignore ZwlrScreencopyManagerV1);
 
 use log;
 
@@ -63,30 +136,27 @@ pub struct FrameCopy {
 }
 
 pub struct FrameCapturer {
-    pub buffer: wayland_client::Main<wayland_client::protocol::wl_buffer::WlBuffer>,
+    pub buffer: wayland_client::protocol::wl_buffer::WlBuffer,
     pub frame_format: FrameFormat,
     pub mem_file: File,
 }
 
 
-
 pub fn setup_capture(
-    display: &Display,
+    globals: &mut GlobalList,
+    conn: &mut Connection,
     output: &WlOutput,
 ) -> Result<FrameCapturer, Box<dyn Error>> {
-
-    let mut event_queue = display.create_event_queue();
-    let attached_display = (*display).clone().attach(event_queue.token());
-
-    // Instantiating the global manager.
-    let globals = GlobalManager::new(&attached_display);
-    event_queue.sync_roundtrip(&mut (), |_, _, _| unreachable!())?;
-
-    let frame_format_option: Rc<RefCell<Option<FrameFormat>>> = Rc::new(RefCell::new(None));
-    let frame_done: Rc<AtomicBool> = Rc::new(AtomicBool::new(false));
+    let mut state = CaptureFrameState {
+        formats: Vec::new(),
+        state: None,
+        buffer_done: AtomicBool::new(false),
+    };
+    let mut event_queue = conn.new_event_queue::<CaptureFrameState>();
+    let qh = event_queue.handle();
 
     // Instantiating screencopy manager.
-    let screencopy_manager = match globals.instantiate_exact::<ZwlrScreencopyManagerV1>(3) {
+    let screencopy_manager = match globals.bind::<ZwlrScreencopyManagerV1, _, _>(&qh, 3..=3, ()) {
         Ok(x) => x,
         Err(e) => {
             log::error!("Failed to create screencopy manager. Does your compositor implement ZwlrScreencopy?");
@@ -95,59 +165,14 @@ pub fn setup_capture(
     };
 
     // Capture output.
-    let frame: Main<ZwlrScreencopyFrameV1> = screencopy_manager.capture_output(0, &output);
-    // Assign callback to frame.
-    frame.quick_assign({
-        // Clone data to mutate their values in the callback.
-        let mut frame_format = frame_format_option.clone();
-        let frame_done = frame_done.clone();
-        move |_, event, _| {
-            match event {
-                zwlr_screencopy_frame_v1::Event::Buffer {
-                    format,
-                    width,
-                    height,
-                    stride,
-                } => {
-                    log::debug!("Received Buffer event");
-                    if matches!(
-                        format,
-                        wl_shm::Format::Argb8888 | wl_shm::Format::Xrgb8888 | wl_shm::Format::Xbgr8888
-                    ) {
-                        frame_format.borrow_mut().replace(Some(FrameFormat {
-                            format,
-                            width,
-                            height,
-                            stride,
-                        }));
-                    }
-                }
-                zwlr_screencopy_frame_v1::Event::Flags { .. } => {
-                    log::debug!("Received Flags event");
-                }
-                zwlr_screencopy_frame_v1::Event::Damage { .. } => {
-                    log::debug!("Received Damage event");
-                }
-                zwlr_screencopy_frame_v1::Event::LinuxDmabuf { .. } => {
-                    log::debug!("Received LinuxDmaBuf event");
-                }
-                zwlr_screencopy_frame_v1::Event::BufferDone => {
-                    log::debug!("Received bufferdone event");
-                    frame_done.store(true, Ordering::SeqCst);
-                }
-                e => log::debug!("Unknown event {:?}", e)
-            };
-        }
-    });
+    screencopy_manager.capture_output(0, &output, &qh, ());
 
-    // Empty internal event buffer until buffer_done is set to true which is when the Buffer done
-    // event is fired, aka the capture from the compositor is succesful.
-    while !frame_done.load(Ordering::SeqCst) {
-        event_queue.dispatch(&mut (), |_, _, _| unreachable!())?;
+    while !state.buffer_done.load(Ordering::SeqCst) {
+        event_queue.blocking_dispatch(&mut state)?;
     }
 
     // TODO, better error handling
-    let frame_format = frame_format_option.try_borrow().unwrap().unwrap();
+    let frame_format = state.formats.get(0).unwrap().clone();
 
     log::debug!(
         "Received compositor frame buffer format: {:#?}",
@@ -163,14 +188,16 @@ pub fn setup_capture(
     mem_file.set_len(frame_bytes as u64)?;
 
     // Instantiate shm global.
-    let shm = globals.instantiate_exact::<wl_shm::WlShm>(1)?;
-    let shm_pool = shm.create_pool(mem_fd, frame_bytes as i32);
+    let shm = globals.bind::<WlShm, _, _>(&qh, 1..=1, ()).unwrap();
+    let shm_pool = shm.create_pool(mem_fd, frame_bytes as i32, &qh, ());
     let buffer = shm_pool.create_buffer(
         0,
         frame_format.width as i32,
         frame_format.height as i32,
         frame_format.stride as i32,
         frame_format.format,
+        &qh,
+        (),
     );
 
     Ok(FrameCapturer{
@@ -182,19 +209,21 @@ pub fn setup_capture(
 
 /// Get a FrameCopy instance with screenshot pixel data for any wl_output object.
 pub fn capture_output_frame(
-    display: &Display,
+    globals: &mut GlobalList,
+    conn: &mut Connection,
     output: &WlOutput,
     capturer: &mut FrameCapturer,
 ) -> Result<FrameCopy, Box<dyn Error>> {
-    let mut event_queue = display.create_event_queue();
-    let attached_display = (*display).clone().attach(event_queue.token());
-
-    // Instantiating the global manager.
-    let globals = GlobalManager::new(&attached_display);
-    event_queue.sync_roundtrip(&mut (), |_, _, _| unreachable!())?;
+    let mut state = CaptureFrameState {
+        formats: Vec::new(),
+        state: None,
+        buffer_done: AtomicBool::new(false),
+    };
+    let mut event_queue = conn.new_event_queue::<CaptureFrameState>();
+    let qh = event_queue.handle();
 
     // Instantiating screencopy manager.
-    let screencopy_manager = match globals.instantiate_exact::<ZwlrScreencopyManagerV1>(3) {
+    let screencopy_manager = match globals.bind::<ZwlrScreencopyManagerV1, _, _>(&qh, 3..=3, ()) {
         Ok(x) => x,
         Err(e) => {
             log::error!("Failed to create screencopy manager. Does your compositor implement ZwlrScreencopy?");
@@ -202,62 +231,20 @@ pub fn capture_output_frame(
         }
     };
 
-    event_queue.sync_roundtrip(&mut (), |_, _, _| {log::error!("Failed to do a sync roundtrip") })?;
-    let mut frame_state: Rc<RefCell<Option<FrameState>>> = Rc::new(RefCell::new(None));
-    let frame_buffer_done = Rc::new(AtomicBool::new(false));
     // Capture output.
-    let frame: Main<ZwlrScreencopyFrameV1> = screencopy_manager.capture_output(0, &output);
-    // Assign callback to frame.
-    frame.quick_assign({
-        // Clone data to mutate their values in the callback.
-        let mut frame_state = frame_state.clone();
-        let frame_buffer_done = frame_buffer_done.clone();
-        move |_, event, _| {
-            match event {
-                zwlr_screencopy_frame_v1::Event::Flags { .. } => {
-                    log::debug!("Received Flags event");
-                }
-                zwlr_screencopy_frame_v1::Event::Ready { .. } => {
-                    // If the frame is successfully copied, a “flags” and a “ready” events are sent. Otherwise, a “failed” event is sent.
-                    // This is useful when we call .copy on the frame object.
-                    log::debug!("Received Ready event");
-                    frame_state.borrow_mut().replace(Some(FrameState::Finished));
-                }
-                zwlr_screencopy_frame_v1::Event::Failed => {
-                    log::debug!("Received Failed event");
-                    frame_state.borrow_mut().replace(Some(FrameState::Failed));
-                }
-                zwlr_screencopy_frame_v1::Event::Damage { .. } => {
-                    log::debug!("Received Damage event");
-                }
-                zwlr_screencopy_frame_v1::Event::LinuxDmabuf { .. } => {
-                    log::debug!("Received LinuxDmaBuf event");
-                }
-                zwlr_screencopy_frame_v1::Event::BufferDone => {
-                    log::debug!("Received bufferdone event");
-                    frame_buffer_done.store(true, Ordering::SeqCst);
-                }
-                e => log::debug!("Unknown event {:?}", e)
-            };
-        }
-    });
+    let frame: ZwlrScreencopyFrameV1 = screencopy_manager.capture_output(0, &output, &qh, ());
 
-    // Empty internal event buffer until buffer_done is set to true which is when the Buffer done
-    // event is fired, aka the capture from the compositor is succesful.
-    while !frame_buffer_done.load(Ordering::SeqCst) {
-        event_queue.dispatch(&mut (), |_, _, _| unreachable!())?;
+    while !state.buffer_done.load(Ordering::SeqCst) {
+        event_queue.blocking_dispatch(&mut state)?;
     }
 
     // Copy the pixel data advertised by the compositor into the buffer we just created.
     frame.copy(&capturer.buffer);
-    frame_buffer_done.store(false, Ordering::SeqCst);
 
     // On copy the Ready / Failed events are fired by the frame object, so here we check for them.
     loop {
-        event_queue.dispatch(&mut (), |_, _, _| {})?;
-
         // Basically reads, if frame state is not None then...
-        if let Some(state) = frame_state.borrow_mut().take() {
+        if let Some(state) = state.state {
             match state {
                 FrameState::Failed => {
                     log::error!("Frame copy failed");
@@ -290,6 +277,8 @@ pub fn capture_output_frame(
             }
         }
     }
+    // TODO: Unused
+    // event_queue.blocking_dispatch(&mut state)?;
 }
 
 /// Return a RawFd to a shm file. We use memfd create on linux and shm_open for BSD support.

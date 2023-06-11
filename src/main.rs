@@ -8,7 +8,11 @@ use std::{
 };
 
 use hass_rs::client;
-use wayland_client::{protocol::wl_output::WlOutput, Display};
+use wayland_client::{
+    globals::{registry_queue_init, GlobalListContents},
+    protocol::{wl_output::WlOutput, wl_registry},
+    Connection, QueueHandle,
+};
 use colors_transform::{self, Color, Hsl};
 use serde_json::json;
 use dotenv::dotenv;
@@ -17,6 +21,22 @@ mod clap;
 mod output;
 mod prominent_color;
 mod backend;
+
+struct AppState;
+
+impl wayland_client::Dispatch<wl_registry::WlRegistry, GlobalListContents> for AppState {
+    fn event(
+        _: &mut AppState,
+        _: &wl_registry::WlRegistry,
+        _: wl_registry::Event,
+        _: &GlobalListContents,
+        _: &Connection,
+        _: &QueueHandle<AppState>,
+    ) {
+    }
+}
+
+
 
 #[cfg_attr(feature = "async-std-runtime", async_std::main)]
 #[async_std::main]
@@ -40,9 +60,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     log::trace!("Logger initialized.");
 
     // Display setup
-    let display = Display::connect_to_env()?;
+    let mut conn = Connection::connect_to_env().unwrap();
+    let (mut globals, _) = registry_queue_init::<AppState>(&conn).unwrap();
+
     if args.is_present("listoutputs") {
-        let valid_outputs = output::get_all_outputs(display);
+        let valid_outputs = output::get_all_outputs(&mut globals, &mut conn);
         for output in valid_outputs {
             log::info!("{:#?}", output.name);
         }
@@ -59,13 +81,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut client = client::connect(&host, port).await?;
     client.auth_with_longlivedtoken(token.as_str()).await?;
 
+
+
     let output: WlOutput = if args.is_present("output") {
         output::get_wloutput(
             args.value_of("output").unwrap().trim().to_string(),
-            output::get_all_outputs(display.clone()),
+            output::get_all_outputs(&mut globals, &mut conn),
         )
     } else {
-        output::get_all_outputs(display.clone())
+        output::get_all_outputs(&mut globals, &mut conn)
             .first()
             .unwrap()
             .wl_output
@@ -73,10 +97,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let duration = time::Duration::from_millis(pause_duration);
-    let mut capturer = backend::setup_capture(&display, &output).unwrap();
+    let mut capturer = backend::setup_capture(&mut globals,&mut conn, &output).unwrap();
     let mut last_value = Hsl::from(0.0,0.0,0.0);
     loop {
-        let frame_copy = backend::capture_output_frame(&display, &output, &mut capturer).unwrap();
+        let frame_copy = backend::capture_output_frame(
+            &mut globals,
+            &mut conn,
+            &output,
+            &mut capturer,
+        )?;
         let hsl = prominent_color::determine_prominent_color(frame_copy);
         if !hsl.eq(&last_value) {
             log::info!("Changing color to {:#?}", hsl);
