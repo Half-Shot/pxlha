@@ -1,22 +1,23 @@
 use colors_transform::{Hsl, Rgb, Color};
 use image::{ColorType};
-use crate::backend::FrameCopy;
+use crate::backend::{FrameCopy};
 
 
 /**
  * Minimum lightness for a pixel.
  */
-const LIGHTNESS_MIN: f32 = 0.15;
+const LIGHTNESS_MIN: f32 = 15.0;
 
 /**
  * Minimum saturation for a pixel.
  */
-const SATURATION_MIN: f32 = 0.15;
+const SATURATION_MIN: f32 = 10.0;
 
 /**
  * How many pixels to skip in a chunk, for performance.
  */
 const SKIP_PIXEL: usize = 16;
+
 
 pub fn determine_prominent_color(frame_copy: FrameCopy) -> Hsl {
     if ColorType::Rgba8 != frame_copy.frame_color_type {
@@ -28,7 +29,7 @@ pub fn determine_prominent_color(frame_copy: FrameCopy) -> Hsl {
 
     let mut most_prominent= Hsl::from(0.0, 0.0, 0.0);
     let mut most_prominent_idx = 0;
-    for chunk in frame_copy.frame_mmap.chunks_exact(4 + (SKIP_PIXEL*4)) {
+    for chunk in frame_copy.data.chunks_exact(4 + (SKIP_PIXEL*4)) {
         let hsl = Rgb::from(chunk[0] as f32, chunk[1] as f32, chunk[2] as f32).to_hsl();
 
         // Reject any really dark colours.
@@ -41,7 +42,7 @@ pub fn determine_prominent_color(frame_copy: FrameCopy) -> Hsl {
         // Split into 36 blocks
         let h_index = (hsl.get_hue() as usize) / 10;
         let s_index = (hsl.get_saturation() as usize) / 5;
-        let l_index = (hsl.get_saturation() as usize) / 5;
+        let l_index = (hsl.get_lightness() as usize) / 5;
         let new_prominence = heatmap[h_index][s_index][l_index] + 1;
         // With what's left, primary focus on getting the most prominent colour in the frame.
         heatmap[h_index][s_index][l_index] = new_prominence;
@@ -57,3 +58,61 @@ pub fn determine_prominent_color(frame_copy: FrameCopy) -> Hsl {
     most_prominent
 }
 
+
+#[cfg(test)]
+mod test {
+    use colors_transform::Color;
+    use image::ColorType;
+    use test::Bencher;
+    use wayland_client::protocol::wl_shm::Format;
+    use std::fs::File;
+
+    use crate::{prominent_color::determine_prominent_color, backend::{FrameCopy, FrameFormat}};
+    
+    #[test]
+    fn test_determine_prominent_color() {
+        let decoder = png::Decoder::new(File::open("samples/gradientrb.png").unwrap());
+        let mut reader = decoder.read_info().unwrap();// Allocate the output buffer.
+        let mut buf = vec![0; reader.output_buffer_size()];
+        let info = reader.next_frame(&mut buf).unwrap();
+        let bytes = &buf[..info.buffer_size()];
+    
+        let v = determine_prominent_color( FrameCopy {
+            frame_color_type: ColorType::Rgba8,
+            frame_format: FrameFormat {
+                width: info.width,
+                height: info.height,
+                format: Format::Argb8888,
+                // Unused
+                stride: 0,
+            },
+            data: bytes.to_vec(),
+        });
+    
+        assert_eq!(v.get_hue(), 240.0, "Hue value is incorrect");
+        assert_eq!(v.get_saturation(), 85.0, "Saturation value is incorrect");
+        assert_eq!(v.get_lightness(), 40.0, "Lightness value is incorrect");
+    }
+
+    #[bench]
+    fn bench_determine_prominent_color(b: &mut Bencher) {
+        let decoder = png::Decoder::new(File::open("samples/gradientrb.png").unwrap());
+        let mut reader = decoder.read_info().unwrap();// Allocate the output buffer.
+        let mut buf = vec![0; reader.output_buffer_size()];
+        let info = reader.next_frame(&mut buf).unwrap();
+        let bytes = &buf[..info.buffer_size()];
+
+
+        b.iter(|| determine_prominent_color( FrameCopy {
+            frame_color_type: ColorType::Rgba8,
+            frame_format: FrameFormat {
+                width: info.width,
+                height: info.height,
+                format: Format::Argb8888,
+                // Unused
+                stride: 0,
+            },
+            data: bytes.to_vec(),
+        }));
+    }
+}

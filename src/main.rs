@@ -1,3 +1,5 @@
+#![feature(test)]
+extern crate test;
 use core::time;
 use std::{
     env,
@@ -68,7 +70,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // HASS setup
-    log::info!("Creating the Websocket Client and Authenticate the session");
+    log::info!("Creating the Websocket Client and authneticating the session");
     let token = var("HASS_TOKEN").expect("Please set up the HASS_TOKEN env variable before running this");
     let host = var("HASS_HOST").unwrap_or("localhost".to_string());
     let port = var("HASS_PORT").unwrap_or("80".to_string()).parse::<u16>().expect("Please set up the HASS_PORT env variable before running this");
@@ -95,6 +97,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let duration = time::Duration::from_millis(pause_duration);
     let mut capturer = backend::setup_capture(&mut globals,&mut conn, &output).unwrap();
     let mut last_value = Hsl::from(0.0,0.0,0.0);
+
+    log::info!("Capturing frames");
     loop {
         let frame_copy = backend::capture_output_frame(
             &mut globals,
@@ -103,6 +107,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             &mut capturer,
         )?;
         let hsl = prominent_color::determine_prominent_color(frame_copy);
+        log::debug!("Captured frame -> {:#?}", hsl);
         if !hsl.eq(&last_value) {
             log::info!("Changing color to {:#?}", hsl);
     

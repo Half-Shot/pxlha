@@ -6,7 +6,7 @@ use std::{
     os::unix::prelude::RawFd,
     process::exit,
     sync::atomic::{AtomicBool, Ordering},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{SystemTime, UNIX_EPOCH}, io::{Read, Seek, SeekFrom},
 };
 
 use nix::{
@@ -18,8 +18,6 @@ use nix::{
 use image::{
     ColorType,
 };
-
-use memmap2::MmapMut;
 
 use wayland_client::{
     delegate_noop,
@@ -132,7 +130,7 @@ enum FrameState {
 pub struct FrameCopy {
     pub frame_format: FrameFormat,
     pub frame_color_type: ColorType,
-    pub frame_mmap: MmapMut,
+    pub data: Vec<u8>,
 }
 
 pub struct FrameCapturer {
@@ -234,9 +232,11 @@ pub fn capture_output_frame(
     // Capture output.
     let frame: ZwlrScreencopyFrameV1 = screencopy_manager.capture_output(0, output, &qh, ());
 
+    log::debug!("Waiting for buffer");
     while !state.buffer_done.load(Ordering::SeqCst) {
         event_queue.blocking_dispatch(&mut state)?;
     }
+    log::debug!("Buffer done");
 
     // Copy the pixel data advertised by the compositor into the buffer we just created.
     frame.copy(&capturer.buffer);
@@ -252,8 +252,9 @@ pub fn capture_output_frame(
                 }
                 FrameState::Finished => {
                     // Create a writeable memory map backed by a mem_file.
-                    let mut frame_mmap = unsafe { MmapMut::map_mut(&capturer.mem_file)? };
-                    let data = &mut *frame_mmap;
+                    let mut data = vec![];
+                    capturer.mem_file.read_to_end(&mut data).unwrap(); // unsafe { MmapMut::map_mut(&capturer.mem_file)? };
+                    capturer.mem_file.rewind().unwrap();
                     let frame_color_type = match capturer.frame_format.format {
                         wl_shm::Format::Argb8888 | wl_shm::Format::Xrgb8888 => {
                             // Swap out b with r as these formats are in little endian notation.
@@ -271,14 +272,13 @@ pub fn capture_output_frame(
                     return Ok(FrameCopy {
                         frame_format: capturer.frame_format,
                         frame_color_type,
-                        frame_mmap,
+                        data,
                     });
                 }
             }
         }
+        event_queue.blocking_dispatch(&mut state)?;
     }
-    // TODO: Unused
-    // event_queue.blocking_dispatch(&mut state)?;
 }
 
 /// Return a RawFd to a shm file. We use memfd create on linux and shm_open for BSD support.
