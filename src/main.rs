@@ -41,11 +41,7 @@ impl wayland_client::Dispatch<wl_registry::WlRegistry, GlobalListContents> for A
 #[cfg_attr(feature = "async-std-runtime", async_std::main)]
 #[async_std::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    match dotenv() {
-        // Only warn on failure
-        Err(err) => println!("Warning: Could not load .env {:?}", err),
-        _ => {},
-    }
+    if let Err(err) = dotenv() { println!("Warning: Could not load .env {:?}", err) }
     let args = clap::set_flags().get_matches();
 
     if args.is_present("debug") {
@@ -118,7 +114,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }));
     
             client.call_service("light".to_string(), "turn_on".to_string(), value).await?;
-            last_value = hsl.clone();
+            last_value = hsl;
         }
 
         thread::sleep(duration);

@@ -105,7 +105,7 @@ delegate_noop!(CaptureFrameState: ignore WlShmPool);
 delegate_noop!(CaptureFrameState: ignore WlBuffer);
 delegate_noop!(CaptureFrameState: ignore ZwlrScreencopyManagerV1);
 
-use log;
+
 
 /// Type of frame supported by the compositor. For now we only support Argb8888, Xrgb8888, and
 /// Xbgr8888.
@@ -165,14 +165,14 @@ pub fn setup_capture(
     };
 
     // Capture output.
-    screencopy_manager.capture_output(0, &output, &qh, ());
+    screencopy_manager.capture_output(0, output, &qh, ());
 
     while !state.buffer_done.load(Ordering::SeqCst) {
         event_queue.blocking_dispatch(&mut state)?;
     }
 
     // TODO, better error handling
-    let frame_format = state.formats.get(0).unwrap().clone();
+    let frame_format = *state.formats.get(0).unwrap();
 
     log::debug!(
         "Received compositor frame buffer format: {:#?}",
@@ -232,7 +232,7 @@ pub fn capture_output_frame(
     };
 
     // Capture output.
-    let frame: ZwlrScreencopyFrameV1 = screencopy_manager.capture_output(0, &output, &qh, ());
+    let frame: ZwlrScreencopyFrameV1 = screencopy_manager.capture_output(0, output, &qh, ());
 
     while !state.buffer_done.load(Ordering::SeqCst) {
         event_queue.blocking_dispatch(&mut state)?;
@@ -269,7 +269,7 @@ pub fn capture_output_frame(
                         }
                     };
                     return Ok(FrameCopy {
-                        frame_format: capturer.frame_format.clone(),
+                        frame_format: capturer.frame_format,
                         frame_color_type,
                         frame_mmap,
                     });
